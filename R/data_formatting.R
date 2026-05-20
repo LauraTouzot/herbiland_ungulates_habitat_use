@@ -932,36 +932,9 @@ compute_month_matrix <- function(detection_effort, grouping_days, start_month, e
 }
 
 
+
 compute_site_level_variables <- function(y_matrix, camtraps) {
-  
-  ### Running a Multiple Correspondence Analysis (MCA) to check whether the first axis can be used 
-  ## as a synthesis of the sites' infos regarding their ability to capture a wide detection range
-  camtraps <- camtraps %>% tibble::column_to_rownames(var = "station")
-  
-  site_infos <- camtraps %>% dplyr::mutate(detect_dist = as.factor(detect_dist),
-                                           scente = as.factor(scente),
-                                           fermeture_1 = as.factor(fermeture_1),
-                                           fermeture_2 = as.factor(fermeture_2),
-                                           steep_slope = as.factor(steep_slope)) %>% 
-                             dplyr::select(detect_dist, scente, fermeture_1, fermeture_2, steep_slope)
-  
-  acm <- dudi.acm(site_infos, scannf = FALSE, nf = 2)
-  screeplot(acm)
-  fviz_screeplot(acm, choice = "eigenvalue")
-  summary(acm)
-  
-  barplot(acm$eig / sum(acm$eig) * 100, 
-          names.arg = 1:length(acm$eig),
-          xlab = "Axes", ylab = "% variance expliquée")
-  
-  mean_eig <- mean(acm$eig)
-  sum(acm$eig > mean_eig)
-  fviz_mca_var(acm, repel = TRUE)
-  s.corcircle(acm$co, 1, 2, clabel = 0.7)
-  
-  coord_sites <- acm$li
-  coord_sites$station <- df$station
-  
+
   site_covs <- data.frame(station_year = rownames(y_matrix)) %>% dplyr::mutate(station = stringr::str_extract(station_year, "^[^_]+")) %>%
                                                                  dplyr::left_join(camtraps, by = "station") %>%
                                                                  dplyr::select(habitat, elevation, 
@@ -970,7 +943,7 @@ compute_site_level_variables <- function(y_matrix, camtraps) {
                                                                                detect_dist = as.factor(detect_dist),
                                                                                fermeture_1 = as.factor(fermeture_1),
                                                                                fermeture_2 = as.factor(fermeture_2),
-                                                                               scente = as.factor(scente),
+                                                                               # scente = as.factor(scente),
                                                                                steep_slope = as.factor(steep_slope),
                                                                                elevation = as.numeric(elevation),
                                                                                elevation_scaled = as.numeric(scale(elevation)))
