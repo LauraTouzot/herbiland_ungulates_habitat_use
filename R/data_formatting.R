@@ -1,67 +1,5 @@
 ##### DATA FORMATTING - SELECTION - EXPLORATION #####
 
-### Loading date files
-loading_data_files <- function(path, files_pattern = NULL, required_files = NULL, delimiters = NULL) {
-  
-  # checking that the specified path exists
-  if (!dir.exists(path)) {
-    stop(paste("Path", path, "doesn't exist"))
-  }
-  
-  # defining patterns
-  if (is.null(files_pattern)) {
-    
-    files_pattern <- list(camera_infos_raw = "camera_infos.*\\.csv$",
-                          camera_history_raw = "camera_history.*\\.csv$",
-                          deepfaune_raw = "deepfaune.*\\.csv$")
-  }
-  
-  # defining delimiters
-  if (is.null(delimiters)) {
-    
-    delimiters <- list(camera_infos_raw = ";",
-                       camera_history_raw = ";",
-                       deepfaune_raw = ",")
-  }
-  
-  # creating storage list
-  load_files <- list()
-  
-  # loading files
-  for (file_names in names(files_pattern)) {
-    
-    # finding files matching the specified patterns
-    data_files <- list.files(path, 
-                             pattern = files_pattern[[file_names]], 
-                             full.names = TRUE)
-    
-    if (length(data_files) == 0) {
-      
-      if (!is.null(required_files) && file_names %in% required_files) {
-        stop(paste("Required file", file_names, "not found in", path))
-      }
-      
-      warning(paste("No file found for", file_names, "in", path, "- skipped"))
-      next  
-    }
-    
-    # ensuring there is a no double files
-    if (length(data_files) > 1) {
-      warning(paste(
-        "Several files found for", file_names, 
-        "- use of the first one:", data_files[1]
-      ))
-    }
-    
-    delim <- delimiters[[file_names]]
-    if (is.null(delim)) delim <- ","
-    
-    load_files[[file_names]] <- readr::read_delim(data_files[1], delim = delim, show_col_types = FALSE)
-  }
-  
-  return(load_files)
-}
-
 ### Function to convert all columns containing dates into actual dates 
 ##  i.e. date_move_to | setup_date| retrieval_date | Problem..._from | Problem..._to | model..._from | model..._to | PIR..._from | PIR..._to
 convert_date_columns <- function(df) {
@@ -218,16 +156,32 @@ camtrap_history_selection <- function(camtrap_history,
   cols_to_keep <- c("date", intersect(selected_stations, names(selected_period)))
   seasonal_data_filtered <- selected_period[, cols_to_keep, drop = FALSE]
   
+  # life_histories <- read.csv(file = "data/bauges/life_problems_file.csv")
+  # life_histories <- life_histories %>% dplyr::select(-X)
+  # 
+  # all_dates <- tibble(date = seq(as.Date("2023-05-01"), as.Date("2025-10-31"), by = "day"))
+  # 
+  # df1_full <- all_dates %>% left_join(seasonal_data_filtered, by = "date") %>%
+  #                           dplyr::mutate(dplyr::across(-date, ~ tidyr::replace_na(.x, 0)))
+  # 
+  # life_histories <- life_histories %>% dplyr::mutate(date = as.Date(date))
+  # df2_full <- all_dates %>% left_join(life_histories, by = "date") |>
+  #                           dplyr::mutate(across(-date, ~ tidyr::replace_na(.x, 0)))
+  # 
+  # combined <- left_join(df1_full, df2_full, by = "date")
+  # seasonal_data_filtered <- combined
+  
   return(seasonal_data_filtered)
   
 }
   
   
-  
 
   
 ## working on camera_infos to filter test stations, model Bushnell, and elevation below the defined limit
-camtrap_infos_selection <- function(camera_infos, selected_camtrap_history, elev) {
+# also uniformizing information between study sites
+# and extracting additional variables (eg. % of forested areas, distance to a slope > 40°, visibility, etc)
+camtrap_infos_selection_addition <- function(camera_infos, selected_camtrap_history, visibility, refuges, skilift, elev, site) {
     
   station_names <- setdiff(names(selected_camtrap_history), "date")
   
@@ -245,7 +199,7 @@ camtrap_infos_selection <- function(camera_infos, selected_camtrap_history, elev
                                                  habitat == "rocher" ~ "rocky",
                                                  TRUE ~ habitat)) %>%
               
-               dplyr::select(station, expo, long, lat, elevation, habitat, 
+               dplyr::select(station, area, expo, long, lat, elevation, habitat, 
                              current_model, current_PIR, 
                              detect_dist, scente, fermeture_1, fermeture_2, steep_slope) %>% 
     
@@ -259,9 +213,238 @@ camtrap_infos_selection <- function(camera_infos, selected_camtrap_history, elev
                              habitat != "rocky") # removing Bushnell models and stations set up to an elevation < to the lowest elevation defined as parameter, as well as rocky habitats
  
   
-  return (df)
+  
+  ### Adding northness and slope information from MNT data
+  mnt <- rast("data/MNT_AlpesFR_25m_L93.asc") 
+  slope <- terra::terrain(x = mnt, v = "slope", unit = "degrees")
+  aspect <- terra::terrain(x = mnt, v = "aspect", unit = "degrees")
+  northness <- cos(aspect * pi/180)
+  eastness <- sin(aspect * pi/180)
+  steep_slope_mask <- terra::ifel(slope >= 40, 1, NA) # distance to the nearest cell with slope >= 45°
+  dist_to_steep <- terra::distance(steep_slope_mask)
+  
+  
+  df_sf <- df %>% sf::st_as_sf(coords = c("long", "lat"), crs = 4326) %>%  
+                  sf::st_transform(crs = 2154) 
+  
+  df <- df %>% dplyr::mutate(slope = terra::extract(slope, df_sf)[[2]],
+                             aspect = terra::extract(aspect, df_sf)[[2]],
+                             northness = terra::extract(northness, df_sf)[[2]],
+                             eastness = terra::extract(eastness, df_sf)[[2]],
+                             dist_steep_slope_m = terra::extract(dist_to_steep, df_sf)[[2]])
+  
+  
+  ### Computing distance to the nearest forested area
+  habitats_map <- rast("data/land_cover/all_classes_mosaic_median_AlpesNord_150426_2.tif") 
+  habitats_map <- terra::project(habitats_map, "EPSG:2154", method = "near")
+  
+  forest_mask <- habitats_map == 1
+  forest_only <- terra::ifel(forest_mask, 1, NA) # distance to the nearest forest pixel
+  dist_to_forest <- terra::distance(forest_only)
+  
+  df <- df %>% dplyr::mutate(dist_forest_m = terra::extract(dist_to_forest, df_sf)[[2]])
+  
+  
+  ### Standardizing information regarding visibility
+  default_fermeture_1 <- if (site == "mb") "closed" else "open"
+  default_fermeture_2 <- if (site == "mb") "less_50_prct" else "100_prct"
+  
+  df <- df %>% dplyr::mutate(fermeture_1 = case_when(fermeture_1 %in% c("Semi-ferme", "semi-ferme") ~ "semi_open",
+                                                     fermeture_1 == "Ouvert" ~ "open",
+                                                     fermeture_1 == "Ferme" ~ "closed",
+                                                     TRUE ~ default_fermeture_1),
 
+                              detect_dist = case_when(detect_dist %in% c("10-20m") ~ "10_20m",
+                                                     detect_dist %in% c("20-30m") ~ "20_30m",
+                                                     detect_dist %in% c("<10m", "0-10m") ~ "less_10m",
+                                                     TRUE ~ "up_30m")) %>%
+  
+                  dplyr::mutate(across(c(habitat, current_model, detect_dist, fermeture_1, fermeture_2), as.factor))
+  
+  ### Adding visibility
+  visibility <- visibility %>% dplyr::select(station, dist_sentier_m, prox_sentiers_350, prop_sentier_vis) %>%
+                               dplyr::rename(dist_path_m = dist_sentier_m, 
+                                             prox_path_350 = prox_sentiers_350,
+                                             prop_path = prop_sentier_vis) %>%
+                               sf::st_drop_geometry() %>% 
+                               dplyr::mutate(prop_path = tidyr::replace_na(prop_path, 0))
+  
+  
+  ### Adding distance to nearest refuge 
+  refuges_proj <- sf::st_transform(refuges, crs = 2154)
+  
+  refuges_proj <- refuges_proj[!sf::st_is_empty(refuges_proj), ]
+  refuges_proj <- refuges_proj[sf::st_is_valid(refuges_proj), ]
+  refuges_proj <- sf::st_make_valid(refuges_proj)
+  refuges_proj <- refuges_proj[!sf::st_is_empty(refuges_proj), ]
+  refuges_pts <- suppressWarnings(sf::st_centroid(refuges_proj))
+  
+  df_sf_l93 <- sf::st_transform(df_sf, crs = 2154)
+  nearest_idx <- sf::st_nearest_feature(df_sf_l93, refuges_pts)
+  df$dist_refuge_m <- as.numeric(sf::st_distance(df_sf_l93,
+                                                 refuges_pts[nearest_idx, ],
+                                                 by_element = TRUE))
+  
+  ### Adding distance to nearest skilift
+  skilift_proj <- sf::st_transform(skilift, crs = 2154)
+  skilift_proj <- skilift_proj[!sf::st_is_empty(skilift_proj), ]
+  skilift_proj <- skilift_proj[sf::st_is_valid(skilift_proj), ]
+  skilift_proj <- sf::st_make_valid(skilift_proj)
+  skilift_proj <- skilift_proj[!sf::st_is_empty(skilift_proj), ]
+
+  nearest_lift <- sf::st_nearest_feature(df_sf_l93, skilift_proj)
+  df$dist_skilift_m <- as.numeric(sf::st_distance(df_sf_l93,
+                                                  skilift_proj[nearest_lift, ],
+                                                  by_element = TRUE))
+  
+  ### Combining in distance to nearest human feature
+  df <- df %>% dplyr::mutate(dist_human_feature_m = pmin(dist_refuge_m, dist_skilift_m, na.rm = TRUE))
+  
+  all_infos <- left_join(df, visibility, by = "station")
+  
+  
+  if (site == "mb") {
+    df_selected <- all_infos %>% dplyr::select(station, long, lat, area,
+                                               habitat,
+                                               elevation,
+                                               current_model, current_PIR,
+                                               detect_dist, fermeture_1,
+                                               aspect, slope, northness, eastness,
+                                               dist_path_m, prox_path_350,
+                                               dist_steep_slope_m, dist_forest_m, dist_human_feature_m)
+  } else {
+    df_selected <- all_infos %>% dplyr::select(station, long, lat,
+                                               habitat,
+                                               elevation,
+                                               current_model, current_PIR,
+                                               detect_dist, fermeture_1,
+                                               aspect, slope, northness, eastness,
+                                               dist_path_m, prox_path_350,
+                                               dist_steep_slope_m, dist_forest_m, dist_human_feature_m)
   }
+  
+  return (df_selected)
+
+}
+
+
+select_topographic_variables <- function(selected_camtraps_infos, site) {
+  
+  df <- selected_camtraps_infos %>% dplyr::mutate(habitat = as.factor(habitat),
+                                                  detect_dist = as.factor(detect_dist),
+                                                  fermeture_1 = as.factor(fermeture_1),
+                                                  slope = as.numeric(slope),
+                                                  northness = as.numeric(northness))
+  
+  
+  compute_association <- function(x, y) {
+    
+    ok <- complete.cases(x, y)
+    x <- x[ok]; y <- y[ok]
+    if (length(x) < 3) return(NA_real_)
+    
+    # continuous x continuous → Pearson |r|  
+    if (is.numeric(x) && is.numeric(y)) {
+      return(abs(cor(x, y, method = "pearson")))
+    }
+    
+    # continuous x categorical → η
+    if (is.numeric(x) && is.factor(y)) {
+      mod <- aov(x ~ y)
+      ss <- summary(mod)[[1]][["Sum Sq"]]
+      return(sqrt(ss[1] / sum(ss)))
+    }
+    if (is.factor(x) && is.numeric(y)) {
+      mod <- aov(y ~ x)
+      ss <- summary(mod)[[1]][["Sum Sq"]]
+      return(sqrt(ss[1] / sum(ss)))
+    }
+    
+    # categorical × categorical → V of Cramér
+    tab <- table(x, y)
+    if (any(dim(tab) < 2)) return(NA_real_)
+    chi2 <- suppressWarnings(chisq.test(tab, correct = FALSE)$statistic)
+    k <- min(dim(tab)) - 1
+    return(as.numeric(sqrt(chi2 / (sum(tab) * k))))
+  }
+  
+  # define variables to test
+  vars <- c("habitat", "detect_dist", "fermeture_1", 
+            "slope", "northness", "eastness")
+  
+  df_check <- df %>% dplyr::select(dplyr::all_of(vars))
+  
+  
+  # building on the correlation matrix
+  n <- length(vars)
+  assoc_mat <- matrix(NA, n, n, dimnames = list(vars, vars))
+  
+  for (i in seq_len(n)) {
+    for (j in seq_len(n)) {
+      if (i == j) {
+        assoc_mat[i, j] <- 1
+      } else if (i < j) {
+        v <- compute_association(df_check[[i]], df_check[[j]])
+        assoc_mat[i, j] <- v
+        assoc_mat[j, i] <- v
+      }
+    }
+  }
+  
+  round(assoc_mat, 2)
+  
+  # plotting the plot
+  assoc_long <- assoc_mat %>% as.data.frame() %>%
+                              tibble::rownames_to_column("var1") %>%
+                              tidyr::pivot_longer(-var1, names_to = "var2", 
+                                                  values_to = "association")
+  
+  var_labels <- c(habitat = "Habitat",
+                  detect_dist = "Detection distance",
+                  fermeture_1 = "Openness (level)",
+                  slope = "Slope",
+                  northness = "Northness")
+  
+  var_order <- c("northness", "slope",
+                 "detect_dist", "fermeture_1",
+                 "habitat")
+  
+  assoc_long <- assoc_mat %>% as.data.frame() %>%
+                              tibble::rownames_to_column("var1") %>%
+                              tidyr::pivot_longer(-var1, names_to = "var2",
+                                                  values_to = "association") %>%
+                          
+                              dplyr::mutate(idx1 = match(var1, var_order),
+                                            idx2 = match(var2, var_order)) %>%
+                              dplyr::filter(idx1 < idx2) %>%
+                              dplyr::select(-idx1, -idx2) %>%
+                          
+                              dplyr::mutate(var1 = factor(var_labels[var1], 
+                                                          levels = var_labels[var_order]),
+                                            var2 = factor(var_labels[var2], 
+                                                          levels = var_labels[var_order]))
+
+  
+  ggplot(assoc_long, aes(x = var1, y = var2, fill = association)) +
+                     geom_tile(color = "white") +
+                     geom_text(aes(label = sprintf("%.2f", association)), size = 3.5) +
+                     scale_fill_gradientn(colours = c("white", "#C5C8D4", "#7FA4C4", "#3D5A80", "#1F2C43"),
+                                          limits = c(0, 1),
+                                          name = "|r| / η / V") +
+                     labs(title = "Associations between site-level variables",
+                          subtitle = "Pearson |r| (num-num), η (num-cat), Cramér V (cat-cat)",
+                          x = NULL, y = NULL) +
+                     theme_minimal() +
+                     theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+                           axis.text.y = element_text(size = 10),
+                           panel.grid = element_blank())
+  
+  ggplot2::ggsave(paste0("figures/correlative_variables/associations_site_vars_", site, ".png"),
+                  width = 8, height = 6, dpi = 300)
+  
+  
+
+}
 
 
 ### Function to filter deepfaune outputs based on the defined identification score (some names' corrections might also be required) and selected stations
@@ -274,8 +457,10 @@ filter_deepfaune_outputs <- function(deepfaune, selected_camtraps, selected_camt
                       dplyr::mutate(station = stringr::str_extract(filename, "^[^_]+"),
                                     datetime_date = lubridate::ymd(stringr::str_extract(filename, "\\d{4}-\\d{2}-\\d{2}")),
                                     datetime_time = hms::as_hms(as.character(gsub("-", ":", stringr::str_extract(filename, "\\d{2}-\\d{2}-\\d{2}(?=\\(|\\.)"))))) %>%
-                      dplyr::select(station, datetime_date, datetime_time, predictionbase, scorebase) %>%
-                      dplyr::filter(scorebase >= id_score)
+                      dplyr::filter(score >= id_score) %>%                 
+                      dplyr::select(station, datetime_date, datetime_time, top1, score) %>%
+                      dplyr::rename(scorebase = score,
+                                    predictionbase = top1)
                     
   station_names <- selected_camtraps$station
   study_period <- selected_camtrap_history$date
@@ -313,7 +498,7 @@ filter_deepfaune_outputs <- function(deepfaune, selected_camtraps, selected_camt
 }
 
 ### Function to visualize species presence by study site - simple histograms
-visualize_species_presence <- function(df, score_id, site, output_dir = "figures") {
+visualize_species_presence <- function(df, score_id, site, output_dir = "figures/general_plots") {
   
   summary <- df %>% dplyr::filter(predictionbase != "empty") %>%
                     dplyr::group_by(predictionbase) %>% 
@@ -325,11 +510,11 @@ visualize_species_presence <- function(df, score_id, site, output_dir = "figures
   file_name <- paste0(output_dir, "/", site, "_totaldetections_", score_id, ".png")
   png(filename = file_name, width = 2000, height = 1200, res = 300)
   
-  colors <- hcl.colors(nrow(summary), palette = "Sunset")
+  pal = ltc("gaby", 15 ,"continuous")
   
   bp <- barplot(height = summary$prct,
                 names.arg = summary$predictionbase,
-                col = colors,
+                col = pal,
                 main = "Total detections per species",
                 ylab = "Percentage (%)",
                 las = 2,        
@@ -342,8 +527,100 @@ visualize_species_presence <- function(df, score_id, site, output_dir = "figures
   
   return(file_name)
   
-  }
+}
 
+
+### Function to extract daily climate variables over the study period at the site level
+create_climate_variables_matrix <- function(selected_camtraps,
+                                            s2m_atmo,
+                                            s2m_soil,
+                                            start_year,
+                                            end_year,
+                                            start_month,
+                                            end_month,
+                                            crs_projected = 2154) {
+  
+  s2m_points <- s2m_atmo %>% dplyr::distinct(point_id, lon, lat, alti, slope, aspect, massif) %>%
+                             dplyr::mutate(dplyr::across(c(lon, lat, alti, slope, aspect, massif),
+                             ~ as.numeric(.x)))
+  
+  # Extracting S2M points the closest to each selected camtraps based on location, as well as elevation, aspect and slope
+  stations_sf <- selected_camtraps %>% sf::st_as_sf(coords = c("long", "lat"), crs = 4326) %>%
+                                       sf::st_transform(crs = crs_projected)
+  
+  s2m_sf <- s2m_points %>% sf::st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+                           sf::st_transform(crs = crs_projected)
+  
+  nearest_idx <- sf::st_nearest_feature(stations_sf, s2m_sf)
+  
+  stations_info <- selected_camtraps %>% dplyr::select(station, elevation, slope, aspect) %>%
+                                         dplyr::rename(slope_stn = slope, aspect_stn = aspect) %>%
+                                         dplyr::mutate(massif = s2m_points$massif[nearest_idx])
+  
+  # Computing circular angular distance for aspect
+  # in S2M: aspect = -1 for flat ground (slope = 0)
+  aspect_dist <- function(a1, a2) {
+    flat <- (a1 < 0) | (a2 < 0)         
+    raw  <- abs(a1 - a2) %% 360
+    circ <- pmin(raw, 360 - raw)
+    ifelse(flat, 0, circ)
+  }
+  
+  # Selecting best S2M point for each cameratrap
+  station_to_point <- stations_info %>% dplyr::inner_join(s2m_points, by = "massif", relationship = "many-to-many") %>%
+                                        dplyr::mutate(d_alt = abs(elevation - alti),
+                                                      d_aspect = aspect_dist(aspect_stn, aspect),
+                                                      d_slope = abs(slope_stn - slope)) %>%
+                                        dplyr::group_by(station) %>%
+                                        dplyr::arrange(d_alt, d_aspect, d_slope, .by_group = TRUE) %>%
+                                        dplyr::slice(1) %>%
+                                        dplyr::ungroup() %>%
+                                        dplyr::transmute(station, point_id, massif,
+                                                         stn_elev   = elevation,  s2m_alti   = alti,
+                                                         stn_aspect = aspect_stn, s2m_aspect = aspect,
+                                                         stn_slope  = slope_stn,  s2m_slope  = slope,
+                                                         d_alt, d_aspect, d_slope)
+  
+  # Grid cameratrap × date on study period
+  all_dates <- purrr::map(start_year:end_year, function(yr) {
+    seq(lubridate::make_date(yr, start_month, 1),
+        lubridate::make_date(yr, end_month, lubridate::days_in_month(
+          lubridate::make_date(yr, end_month, 1))),
+        by = "day")
+  }) %>% purrr::reduce(c)
+  
+  grid <- tidyr::expand_grid(station = station_to_point$station,
+                             date = all_dates) %>%
+          dplyr::left_join(station_to_point, by = "station")
+  
+  # Extracting maximal daily air temperature
+  relevant_points <- unique(station_to_point$point_id)
+  
+  s2m_atmo_daily <- s2m_atmo %>% dplyr::filter(point_id %in% relevant_points) %>%
+                                 dplyr::mutate(date = lubridate::as_date(datetime)) %>%
+                                 dplyr::filter(lubridate::year(date)  %in% start_year:end_year,
+                                               lubridate::month(date) %in% start_month:end_month) %>%
+                                 dplyr::group_by(point_id, date) %>%
+                                 dplyr::summarise(tair_max = max(tair, na.rm = TRUE),
+                                                 .groups = "drop") %>%
+                                 dplyr::mutate(tair_max = ifelse(is.infinite(tair_max), NA_real_, tair_max))
+  
+  # Extracting daily snow depth
+  s2m_soil_daily <- s2m_soil %>% dplyr::filter(point_id %in% relevant_points) %>%
+                                 dplyr::mutate(date = lubridate::as_date(datetime)) %>%
+                                 dplyr::filter(lubridate::year(date)  %in% start_year:end_year,
+                                               lubridate::month(date) %in% start_month:end_month) %>%
+                                 dplyr::group_by(point_id, date) %>%
+                                 dplyr::summarise(snow_depth_m = mean(sdepth, na.rm = TRUE),
+                                                 .groups = "drop") %>%
+                                 dplyr::mutate(snow_depth_m = ifelse(is.nan(snow_depth_m), NA_real_, snow_depth_m))
+  
+  # Merge both variables
+  df <- grid %>% dplyr::left_join(s2m_atmo_daily, by = c("point_id", "date")) %>%
+                 dplyr::left_join(s2m_soil_daily, by = c("point_id", "date"))
+  
+  return(df)
+}
 
 ### Functions to compute and plot time between detections and time spent in from of the camera trap at the species - study site scale 
 compute_detection_intervals <- function(deepfaune_filtered, species_name, max_gap_sec) {
@@ -387,13 +664,13 @@ compute_detection_intervals <- function(deepfaune_filtered, species_name, max_ga
 
 
 
-plot_density_per_site_species <- function(detection_intervals_list, site, species, output_dir = "figures") {
+plot_density_per_site_species <- function(detection_intervals_list, site, species, output_dir = "figures/general_plots") {
 
   detection_intervals <- detection_intervals_list$intervals_station_year
   
   years_list <- split(detection_intervals, detection_intervals$year)
-  cols <- viridis(length(years_list), option = "B")
-
+  pal = ltc("gaby", 8, "continuous")
+  
   file_name <- paste0(output_dir, "/", site, "_", gsub(" ", "_", species), "_densities.png")
   png(filename = file_name, width = 2000, height = 1200, res = 300)
   
@@ -415,7 +692,7 @@ plot_density_per_site_species <- function(detection_intervals_list, site, specie
   for (yr in names(years_list)) {
     dens_year <- density(years_list[[yr]]$time_diff_hours, na.rm = TRUE)
     dens_year$y <- dens_year$y / max(dens_year$y)
-    lines(dens_year, col = cols[i], lwd = 2)
+    lines(dens_year, col = pal[i], lwd = 2)
     i <- i + 1
   }
   
@@ -434,13 +711,13 @@ plot_density_per_site_species <- function(detection_intervals_list, site, specie
   for (yr in names(years_list)) {
     dens_year <- density(years_list[[yr]]$time_spent_sec)
     dens_year$y <- dens_year$y / max(dens_year$y)
-    lines(dens_year, col = cols[i], lwd = 2)
+    lines(dens_year, col = pal[i], lwd = 2)
     i <- i + 1
   }
   
   legend("topright",  
          legend = c("All years", names(years_list)),
-         col = c("black", cols),
+         col = c("black", pal),
          lwd = 2,
          cex = 0.5,        
          bty = "n", 
@@ -572,8 +849,11 @@ calculate_rai <- function(detection_nb, grouping_days, start_month) {
 
 
 
-plot_rai <- function(camera_infos, detection_matrix, rai, site, species, grouping_days, start_month) {
-
+plot_rai <- function(camera_infos, detection_matrix, rai, site, species, grouping_days, start_month, max_years_per_plot = 3) {
+  
+  rai <- rai %>% dplyr::mutate(station = as.character(station))
+  camera_infos <- camera_infos %>% dplyr::mutate(station = as.character(station))
+  detection_matrix <- detection_matrix %>% dplyr::mutate(station = as.character(station))
 
   if (is.null(rai) || nrow(rai) == 0) {
     warning("No RAI data to plot")
@@ -591,97 +871,113 @@ plot_rai <- function(camera_infos, detection_matrix, rai, site, species, groupin
 
 
   # Order camtraps based on elevation
-  rai_plot <- rai %>% dplyr::left_join(camera_infos %>% dplyr::select(station, elevation), by = "station") %>%
-                                                        dplyr::mutate(elev_category = dplyr::case_when(elevation < 2000 ~ "Low (<2000m)",
-                                                                                                       elevation >= 2000 & elevation <= 2400 ~ "Mid (2000-2400m)",
-                                                                                                       elevation > 2400 ~ "High (>2400m)"))
-                                                      
+  rai_plot <- rai %>% dplyr::left_join(camera_infos %>% dplyr::select(station, elevation), by = "station") 
+
   # Create station order based on elevation (ascending)
-  station_levels <- camera_infos %>% dplyr::filter(station %in% unique(rai$station)) %>%
-                                     dplyr::arrange(elevation) %>%
-                                     dplyr::pull(station)
-  
+  station_order <- rai_plot %>% dplyr::distinct(station, elevation) %>%
+                                dplyr::arrange(elevation) %>%
+                                dplyr::pull(station) %>%
+                                as.character()
+                              
   
   # Apply factor with correct levels to rai_plot
-  rai_plot <- rai_plot %>% dplyr::mutate(station_label = factor(station, levels = station_levels))
+  rai_plot <- rai_plot %>% dplyr::mutate(station_label = factor(station, levels = station_order))
   
   
   # Prepare information regarding non-functioning periods of time
-  non_operational <- detection_matrix %>% dplyr::mutate(year = lubridate::year(date), period = if(grouping_days == 7) {
-                                                 lubridate::isoweek(date)
-                                              } else {
-                                                 day_since_start <- as.numeric(date - as.Date(paste0(year, "-", sprintf("%02d", start_month), "-01")))
-                                                 floor(day_since_start / grouping_days)
-                                              }
-                                              ) %>%
-                                                
-                                           dplyr::filter(is.na(n_detections)) %>%
-                                           dplyr::left_join(camera_infos %>% dplyr::select(station, elevation), by = "station") %>%
-                                           dplyr::mutate(station_label = factor(station, levels = station_levels)) %>%
-                                           dplyr::distinct(station_label, year, period)  
-  
-  # Plotting the plot!
-  p <- ggplot(rai_plot, aes(x = period, y = station_label, fill = rai)) + 
+  non_operational <- detection_matrix %>% dplyr::mutate(year = lubridate::year(date), 
+                                          period = if(grouping_days == 7) {
+                                          lubridate::isoweek(date)
+                                            } else {
+                                              day_since_start <- as.numeric(date - as.Date(paste0(year, "-", sprintf("%02d", start_month), "-01")))
+                                              floor(day_since_start / grouping_days)
+                                            }) %>%
+                                          dplyr::filter(is.na(n_detections)) %>%
+                                          dplyr::left_join(camera_infos %>% dplyr::select(station, elevation), by = "station") %>%
+                                          dplyr::distinct(station, elevation, year, period)  
     
-              geom_tile(data = subset(rai_plot, rai > 0)) +
-              scale_fill_gradientn(colours = c("lavenderblush1", "lavenderblush4", "hotpink3", "hotpink4"),
-                                   limits = c(min(rai_plot$rai[rai_plot$rai > 0]), max(rai_plot$rai, na.rm = TRUE)),
-                                   name = "RAI",
-                                   na.value = "grey80") +
-              
-              geom_tile(data = non_operational,
-                        aes(x = period, y = station_label, fill = NULL, color = "Non-operational"),
-                        fill = "grey80",
-                        alpha = 0.7,
-                        linewidth = 0.1) +
-              
-              geom_tile(data = subset(rai_plot, rai == 0),
-                        fill = "white",
-                        color = "white", linewidth = 0.5) +
-              
-              scale_color_manual(values = c("Non-operational" = "grey30"),
-                                 name = "") +
-              
-              facet_wrap(~ year, scales = "free_x", ncol = n_distinct(rai_plot$year)) +
-              
-              # Labels and titles
-              labs(title = paste("Relative Abundance Index -", species, "-", site),
-                   subtitle = subtitle,
-                   x = x_label,
-                   y = "Station (ordered by elevation)") +
-              
-              # Last settings
-              theme_minimal() +
-              theme(axis.text.x = element_text(angle = 45, hjust = 1),
-                    axis.text.y = element_text(size = 8),
-                    strip.text = element_text(face = "bold", size = 11),
-                    panel.grid = element_blank(),
-                    legend.position = "right",
-                    plot.title = element_text(face = "bold", size = 14),
-                    plot.subtitle = element_text(size = 10)) +
-              
-              scale_x_continuous(expand = c(0, 0)) +
-              scale_y_discrete(expand = c(0, 0))
+    non_operational <- non_operational %>% dplyr::mutate(station_label = factor(station, levels = station_order))
+    
+  # Common color scale limits so the fill gradient is consistent across chunks
+  fill_min <- min(rai_plot$rai[rai_plot$rai > 0], na.rm = TRUE)
+  fill_max <- max(rai_plot$rai, na.rm = TRUE)
   
-  return(p)
+  # Split years into chunks of at most `max_years_per_plot`
+  all_years <- sort(unique(rai_plot$year))
+  year_chunks <- split(all_years, ceiling(seq_along(all_years) / max_years_per_plot))
+  
+  # One plot per chunk
+  plot_list <- lapply(year_chunks, function(yrs) {
+    
+    rai_sub <- rai_plot %>% dplyr::filter(year %in% yrs)
+    non_op_sub <- non_operational %>% dplyr::filter(year %in% yrs)
+    
+    year_range_label <- if (length(yrs) == 1) as.character(yrs) else paste0(min(yrs), "-", max(yrs))
+    
+    # plotting the plot!
+    ggplot(rai_sub, aes(x = period, y = station_label, fill = rai)) + 
+      geom_tile(data = rai_sub %>% dplyr::filter(rai > 0)) +
+      scale_fill_gradientn(colours = c("#BDD3CE", "#83A1C3", "#3F5671", "#013D5A"),
+                           limits = c(fill_min, fill_max),
+                           name = "RAI",
+                           na.value = "grey80") +
+      geom_tile(data = non_op_sub,
+                aes(x = period, y = station_label, fill = NULL, color = "Non-operational"),
+                fill = "grey80", alpha = 0.7, linewidth = 0.1) +
+      geom_tile(data = rai_sub %>% dplyr::filter(rai == 0),
+                fill = "white", color = "white", linewidth = 0.5) +
+      scale_color_manual(values = c("Non-operational" = "grey80"), name = "") +
+      facet_wrap(~ year, scales = "free_x", ncol = length(yrs)) +
+      labs(title = paste("Relative Abundance Index -", species, "-", site, "(", year_range_label, ")"),
+           subtitle = subtitle, x = x_label, y = "Station (ordered by elevation)") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            axis.text.y = element_text(size = 8),
+            strip.text = element_text(face = "bold", size = 11),
+            panel.grid = element_blank(),
+            legend.position = "right",
+            plot.title = element_text(face = "bold", size = 14),
+            plot.subtitle = element_text(size = 10)) +
+      scale_x_continuous(expand = c(0, 0)) +
+      scale_y_discrete(limits = factor(station_order), expand = c(0, 0))
+  })
+  
+  # Name each plot by its year range - used later to build the filename 
+  names(plot_list) <- vapply(year_chunks, function(yrs) {
+    if (length(yrs) == 1) as.character(yrs) else paste0(min(yrs), "-", max(yrs))
+  }, character(1))
+  
+  return(plot_list)
 
 }
 
 
-save_rai_plot <- function(plot, site, species, grouping_days) {
+save_rai_plot <- function(plot_list, site, species, grouping_days) {
+  
+  if (is.null(plot_list) || length(plot_list) == 0) {
+    warning("No plots to save")
+    return(character(0))
+  }
   
   dir.create("figures/rai_plots", recursive = TRUE, showWarnings = FALSE)
   
+  file_paths <- vapply(names(plot_list), function(year_label) {
+  
   file_path <- paste0("figures/rai_plots/rai_", site, "_",
                                               species, "_",
-                                              grouping_days, "days.png")
+                                              grouping_days, "days_",
+                                              year_label, ".png")
   
-  ggplot2::ggsave(filename = file_path, plot = plot,
+  ggplot2::ggsave(filename = file_path, plot = plot_list[[year_label]],
                                         width = 12,
                                         height = 8,
                                         dpi = 300)
   
-  return(file_path)
+  file_path
+  
+  }, character(1))
+  
+  return(unname(file_paths))
   
 }
 
@@ -749,6 +1045,72 @@ compute_detection_effort_for_month_effect <- function(detection_nb, grouping_day
     return(detection_effort)
     
 }
+
+
+
+compute_livestock_presence_for_month_effect <- function(detection_nb, grouping_days, start_month, end_month) {
+  
+  if (is.null(detection_nb)) {
+    warning("No detection matrix provided")
+    return(NULL)
+  }
+  
+  # specific case of a weekly grouping
+  if (grouping_days == 7) {
+    
+    detection_data <- detection_nb %>% dplyr::mutate(year = lubridate::year(date), period = lubridate::isoweek(date))
+    
+  } else { # month by month computation for grouping_days ∈ {2,3,5,6} to include the 31st 
+    
+    n_periods_for_month <- function(n_days_in_month, grouping_days) {
+      
+      floor(n_days_in_month / grouping_days) +
+        ifelse(n_days_in_month %% grouping_days > 0 & n_days_in_month == 31, 0, 
+               ifelse(n_days_in_month %% grouping_days > 0, 1, 0))
+    }
+    
+    
+    assign_period_in_month <- function(day_of_month, n_days_in_month, grouping_days) {
+      
+      n_complete <- floor(n_days_in_month / grouping_days)
+      remainder <- n_days_in_month %% grouping_days
+      p <- floor((day_of_month - 1) / grouping_days)
+      if (remainder > 0) p <- pmin(p, n_complete - 1)
+      return(p)
+      
+    }
+    
+    
+    months_seq <- ((start_month - 1 + 0:11) %% 12) + 1
+    
+    ref_year <- 2000
+    days_per_month <- lubridate::days_in_month(as.Date(paste0(ref_year, "-", sprintf("%02d", months_seq), "-01")))
+    
+    periods_per_month <- purrr::map_int(days_per_month, ~ n_periods_for_month(.x, grouping_days))
+    
+    cumulative_offset <- c(0, cumsum(periods_per_month[-length(periods_per_month)]))
+    offset_lookup <- setNames(cumulative_offset, months_seq)
+    
+    detection_data <- detection_nb %>% dplyr::mutate(year = lubridate::year(date),
+                                                     month = lubridate::month(date),
+                                                     day_of_month = lubridate::mday(date),
+                                                     n_days_in_month = lubridate::days_in_month(date),
+                                                     period_in_month = purrr::pmap_int(list(day_of_month, n_days_in_month), function(d, n) assign_period_in_month(d, n, grouping_days)),
+                                                     month_offset = offset_lookup[as.character(month)],
+                                                     period = month_offset + period_in_month) %>%
+                                      dplyr::select(-month, -day_of_month, -n_days_in_month, -period_in_month, -month_offset)
+  }
+  
+  detection_effort <- detection_data %>% dplyr::group_by(station, year, period) %>%
+                                         dplyr::summarise(effort = sum(!is.na(n_detections)),
+                                                          detection = if (all(is.na(n_detections))) NA_real_ else sum(n_detections, na.rm = TRUE),
+                                         .groups = "drop")
+  
+  return(detection_effort)
+  
+}
+
+
 
 
 
@@ -839,17 +1201,18 @@ compute_effort_matrix <- function(detection_effort, grouping_days, start_month, 
   
   if (grouping_days == 7) {
     
-        station_years <- detection_effort %>% dplyr::distinct(station, year) %>%
-                                              dplyr::rowwise() %>%
-                                              dplyr::mutate(all_periods = list(unique(lubridate::isoweek(seq(as.Date(paste0(year, "-", sprintf("%02d", start_month), "-01")),
-                                                                                                             as.Date(paste0(year, "-", sprintf("%02d", end_month), "-",
-                                                                                                                            lubridate::days_in_month(as.Date(paste0(year, "-", sprintf("%02d", end_month), "-01"))))), by = "day"))))) %>%  
-                                              tidyr::unnest(all_periods) %>%
-                                              dplyr::rename(period = all_periods) %>%
-                                              dplyr::ungroup()
+    station_years <- detection_effort %>% dplyr::distinct(station, year) %>%
+                                          dplyr::rowwise() %>%
+                                          dplyr::mutate(all_periods = list(unique(lubridate::isoweek(seq(as.Date(paste0(year, "-", sprintf("%02d", start_month), "-01")),
+                                                                                                         as.Date(paste0(year, "-", sprintf("%02d", end_month), "-",
+                                                                                                         lubridate::days_in_month(as.Date(paste0(year, "-", sprintf("%02d", end_month), "-01"))))), by = "day"))))) %>%
+                                          tidyr::unnest(all_periods) %>%
+                                          dplyr::rename(period = all_periods) %>%
+                                          dplyr::ungroup()
     
-    effort_full <- station_years %>% dplyr::left_join(detection_effort %>% dplyr::select(station, year, period, effort), by = c("station", "year", "period")) %>%
-                                     dplyr::mutate(effort = tidyr::replace_na(effort, 0))
+    effort_full <- station_years %>% dplyr::left_join(detection_effort %>% dplyr::select(station, year, period, effort),
+                                                      by = c("station", "year", "period"))
+    # Note: DO NOT replace NA by 0 here, NA MUST STAY 
     
   } else {
     
@@ -866,17 +1229,17 @@ compute_effort_matrix <- function(detection_effort, grouping_days, start_month, 
                             dplyr::select(station_year, sort(setdiff(names(.), "station_year"))) %>%
                             tibble::column_to_rownames(var = "station_year")
   
-  effort[is.na(effort)] <- 0
+  # Scaling preserving NAs
+  mat <- as.matrix(effort)
+  scaled_vec <- as.numeric(scale(as.vector(mat)))
+  scaled_mat <- matrix(scaled_vec,
+                       nrow = nrow(mat),
+                       ncol = ncol(mat),
+                       dimnames = dimnames(mat))
   
-  effort_scaled <- as.data.frame(matrix(scale(as.vector(as.matrix(effort))),
-                                 nrow = nrow(effort),
-                                 ncol = ncol(effort),
-                                 dimnames = list(rownames(effort), colnames(effort))))
-
+  as.data.frame(scaled_mat)
   
-  return(effort_scaled)
 }
-
 
 compute_month_matrix <- function(detection_effort, grouping_days, start_month, end_month) {
   
@@ -932,25 +1295,296 @@ compute_month_matrix <- function(detection_effort, grouping_days, start_month, e
 }
 
 
-
-compute_site_level_variables <- function(y_matrix, camtraps) {
-
-  site_covs <- data.frame(station_year = rownames(y_matrix)) %>% dplyr::mutate(station = stringr::str_extract(station_year, "^[^_]+")) %>%
-                                                                 dplyr::left_join(camtraps, by = "station") %>%
-                                                                 dplyr::select(habitat, elevation, 
-                                                                               detect_dist, fermeture_1, fermeture_2, scente, steep_slope) %>%
-                                                                 dplyr::mutate(habitat = as.factor(habitat),
-                                                                               detect_dist = as.factor(detect_dist),
-                                                                               fermeture_1 = as.factor(fermeture_1),
-                                                                               fermeture_2 = as.factor(fermeture_2),
-                                                                               # scente = as.factor(scente),
-                                                                               steep_slope = as.factor(steep_slope),
-                                                                               elevation = as.numeric(elevation),
-                                                                               elevation_scaled = as.numeric(scale(elevation)))
+assign_period <- function(data, grouping_days, start_month) {
   
-  return(site_covs)
+  if (grouping_days == 7) {
+    return(data %>% dplyr::mutate(year = lubridate::year(date),
+                                  period = lubridate::isoweek(date)))
+  }
+  
+  n_periods_for_month <- function(n_days_in_month, grouping_days) {
+    floor(n_days_in_month / grouping_days) +
+      ifelse(n_days_in_month %% grouping_days > 0 & n_days_in_month == 31, 0,
+             ifelse(n_days_in_month %% grouping_days > 0, 1, 0))
+  }
+  
+  assign_period_in_month <- function(day_of_month, n_days_in_month, grouping_days) {
+    n_complete <- floor(n_days_in_month / grouping_days)
+    remainder <- n_days_in_month %% grouping_days
+    p <- floor((day_of_month - 1) / grouping_days)
+    if (remainder > 0) p <- pmin(p, n_complete - 1)
+    p
+  }
+  
+  months_seq <- ((start_month - 1 + 0:11) %% 12) + 1
+  ref_year <- 2000
+  days_per_month <- lubridate::days_in_month(as.Date(paste0(ref_year, "-", sprintf("%02d", months_seq), "-01")))
+  periods_per_month <- purrr::map_int(days_per_month,
+                                      ~ n_periods_for_month(.x, grouping_days))
+  cumulative_offset <- c(0, cumsum(periods_per_month[-length(periods_per_month)]))
+  offset_lookup <- setNames(cumulative_offset, months_seq)
+  
+  data %>% dplyr::mutate(year = lubridate::year(date),
+                         month = lubridate::month(date),
+                         day_of_month = lubridate::mday(date),
+                         n_days_in_month = lubridate::days_in_month(date),
+                         period_in_month = purrr::pmap_int(list(day_of_month, n_days_in_month),
+                                                           function(d, n) assign_period_in_month(d, n, grouping_days)),
+                         month_offset = offset_lookup[as.character(month)],
+                         period = month_offset + period_in_month) %>%
+          dplyr::select(-month, -day_of_month, -n_days_in_month, -period_in_month, -month_offset)
   
 }
+
+
+compute_climate_variable_matrix <- function(daily_climate_matrix,
+                                            variable,
+                                            grouping_days,
+                                            start_month,
+                                            end_month,
+                                            scale = TRUE) {
+  
+  aggregated <- daily_climate_matrix %>% dplyr::filter(lubridate::month(date) >= start_month,
+                                                       lubridate::month(date) <= end_month) %>%
+                                          assign_period(grouping_days, start_month) %>%
+                                          dplyr::group_by(station, year, period) %>%
+                                          dplyr::summarise(value = mean(.data[[variable]], na.rm = TRUE),
+                                                           .groups = "drop") %>%
+                                          dplyr::mutate(value = ifelse(is.nan(value), NA_real_, value))
+  
+  wide_matrix <- aggregated %>% dplyr::arrange(station, year) %>%
+                                dplyr::mutate(period_label = sprintf("p%02d", period),
+                                              station_year = paste0(station, "_", year)) %>%
+                                dplyr::select(station_year, period_label, value) %>%
+                                tidyr::pivot_wider(names_from = period_label, values_from = value) %>%
+                                dplyr::select(station_year, sort(setdiff(names(.), "station_year"))) %>%
+                                tibble::column_to_rownames(var = "station_year")
+  
+  if (!scale) return(as.matrix(wide_matrix))
+
+  mat <- as.matrix(wide_matrix)
+  scaled_vec <- as.numeric(scale(as.vector(mat)))
+  as.data.frame(matrix(scaled_vec,
+                       nrow = nrow(mat), ncol = ncol(mat),
+                       dimnames = dimnames(mat)))
+  
+}
+
+
+
+### Reformatting matrices to have stack also by months
+reshape_to_month_replicates <- function(value_matrix,
+                                        month_matrix,
+                                        standardize = FALSE,
+                                        drop_all_na = TRUE,
+                                        month_levels = month.name) {
+  
+    value_matrix <- as.matrix(value_matrix)
+    month_matrix <- as.matrix(month_matrix)
+    
+    stopifnot(identical(dim(value_matrix), dim(month_matrix)),
+              identical(rownames(value_matrix), rownames(month_matrix)))
+    
+    # long format, period order = column position (avoids "10" < "2")
+    long <- tibble::tibble(station_year = rep(rownames(value_matrix), times = ncol(value_matrix)),
+                           period_idx = rep(seq_len(ncol(value_matrix)), each = nrow(value_matrix)),
+                           month = as.vector(month_matrix),
+                           value = as.vector(value_matrix))
+    
+    combined <- long %>% dplyr::group_by(station_year, month) %>%
+                         dplyr::arrange(period_idx, .by_group = TRUE) %>%
+                         dplyr::mutate(secondary = sprintf("s%02d", dplyr::row_number())) %>%
+                         dplyr::ungroup() %>%
+                         dplyr::mutate(new_id = paste(station_year, month, sep = "_"),
+                                       month_ord = match(month, month_levels))
+    
+    ordered_ids <- combined %>% dplyr::distinct(new_id, station_year, month_ord) %>%
+                                dplyr::arrange(station_year, month_ord) %>%
+                                dplyr::pull(new_id)
+                              
+    wide <- combined %>% dplyr::select(new_id, secondary, value) %>%
+                         tidyr::pivot_wider(names_from = secondary, values_from = value)
+    
+    wide <- wide[match(ordered_ids, wide$new_id), ]
+    
+    result <- wide %>% tibble::column_to_rownames("new_id") %>% as.matrix()
+    result <- result[, sort(colnames(result)), drop = FALSE]
+    
+    if (drop_all_na) {
+      keep   <- apply(result, 1, function(x) !all(is.na(x)))
+      result <- result[keep, , drop = FALSE]
+    }
+    
+    if (standardize) {
+      center <- mean(result, na.rm = TRUE)
+      scl <- sd(result, na.rm = TRUE)
+      result <- (result - center) / scl
+      attr(result, "scaled:center") <- center
+      attr(result, "scaled:scale") <- scl
+    }
+    
+    return(result)
+    
+}
+
+
+
+build_site_covariates_by_month <- function(reshaped_matrix, month_levels = month.name) {
+  
+  tibble::tibble(new_id = rownames(reshaped_matrix)) %>%
+                 tidyr::extract(new_id,
+                                into = c("station_year", "month"),
+                                regex = "^(.*)_([A-Za-z]+)$",
+                                remove = FALSE) %>%
+                 dplyr::mutate(station_year = factor(station_year),
+                               month = factor(month, levels = month_levels))
+  
+
+  }
+
+  
+  
+
+compute_site_level_variables <- function(y_matrix, camtraps, species) {
+  
+  # distance to refuge variable chosen according to the species of interest
+  dist_col <- switch(species,
+                     "chamois" = "dist_steep_slope_m",
+                     "reddeer" = "dist_forest_m",
+                     stop("Unknow species: ", species))
+  
+  site_covs <- tibble::tibble(new_id = rownames(y_matrix)) %>%
+               tidyr::extract(new_id,
+                              into = c("station_year", "month"),
+                              regex  = "^(.*)_([A-Za-z]+)$",
+                              remove = FALSE) %>%
+               dplyr::mutate(station = stringr::str_extract(station_year, "^[^_]+"),
+                             year = stringr::str_extract(station_year, "\\d{4}$")) %>%
+               dplyr::left_join(camtraps, by = "station") %>%
+               dplyr::mutate(station = as.factor(station),
+                             year = as.factor(year),
+                             station_year = as.factor(station_year),
+                             month = factor(month, levels = month.name),
+                            
+                             habitat = as.factor(habitat),
+                             northness = as.numeric(northness),
+                             northness_scaled = as.vector(scale(northness)),
+                             slope = as.numeric(slope),
+                             slope_scaled = as.vector(scale(slope)),
+                            
+                             dist_path = as.numeric(prox_path_350),
+                             dist_path_scaled = as.vector(scale(dist_path)),
+                             dist_human_feature = as.numeric(dist_human_feature_m),
+                             dist_human_feature_scaled = as.vector(scale(dist_human_feature)),
+                            
+                             dist_to_refuge = as.numeric(.data[[dist_col]]),
+                             dist_to_refuge_scaled = as.vector(scale(dist_to_refuge))) %>%
+    
+              dplyr::select(-long, -lat, -current_PIR, -current_model)
+  
+  # sanity check
+  stopifnot(identical(site_covs$new_id, rownames(y_matrix)))
+  
+  site_covs
+}
+
+
+compute_site_coordinates <- function(y_matrix, camtraps) {
+  
+  if (!all(c("station", "long", "lat") %in% names(camtraps))) {
+    stop("camtraps must contain columns: station, long, lat. Got: ",
+         paste(names(camtraps), collapse = ", "))
+  }
+  
+  tibble::tibble(new_id = rownames(y_matrix)) %>% dplyr::mutate(station = stringr::str_extract(new_id, "^[^_]+")) %>%
+                                                  dplyr::left_join(camtraps %>% dplyr::select(station, long, lat), by = "station") %>%
+                                                  sf::st_as_sf(coords = c("long", "lat"), crs = 4326) %>%
+                                                  sf::st_transform(crs = 32632) %>%
+                                                  sf::st_coordinates()
+  
+  }
+
+
+compute_detection_variables <- function(effort_matrix,
+                                        temp_matrix,
+                                        snow_matrix,
+                                        livestock_matrix,
+                                        site_covs) {
+  
+  ref_rows <- site_covs$new_id
+
+  align_to_ref <- function(mat, name, fill_value = NA_real_) {
+
+        aligned <- matrix(fill_value,
+                      nrow = length(ref_rows),
+                      ncol = ncol(mat),
+                      dimnames = list(ref_rows, colnames(mat)))
+    common <- intersect(ref_rows, rownames(mat))
+    aligned[common, ] <- as.matrix(mat)[common, , drop = FALSE]
+    
+    missing <- setdiff(ref_rows, rownames(mat))
+    if (length(missing) > 0) {
+      warning(length(missing), " rows absent of ", name,
+              " filled with ", fill_value, " (",
+              paste(head(missing, 3), collapse = ", "),
+              if (length(missing) > 3) ", ..." else "", ")")
+    }
+    
+    aligned
+  }
+  
+  list(
+    effort     = align_to_ref(effort_matrix, "effort"),
+    temp       = align_to_ref(temp_matrix,   "temp"),
+    snow       = align_to_ref(snow_matrix,   "snow"),
+    livestock  = align_to_ref(livestock_matrix, "livestock"),
+    visibility = factor(site_covs$detect_dist,
+                        levels = c("less_10m", "10_20m", "20_30m", "up_30m")),
+    fermeture  = factor(site_covs$fermeture_1,
+                        levels = c("open", "semi_open", "closed")),
+    month      = factor(site_covs$month, levels = month.name)
+  )
+}
+
+compute_spoccupancy_data <- function(y_matrix, site_covs, det_covs, coordinates_utm) {
+  
+  stopifnot(nrow(y_matrix) == nrow(site_covs),
+            nrow(y_matrix) == length(det_covs$month),
+            nrow(y_matrix) == nrow(coordinates_utm))
+  
+  list(y = y_matrix,
+       occ.covs = site_covs,
+       det.covs = det_covs,
+       coords = coordinates_utm)
+}
+
+
+clean_spocc_data <- function(data_spOcc, occ_cov_names) {
+  
+  keep <- rowSums(is.na(
+    data_spOcc$occ.covs[, occ_cov_names, drop = FALSE]
+  )) == 0
+  
+  if (all(keep)) return(data_spOcc)
+  
+  message(sum(!keep), " sites removed (NA in occ.covs) over ",
+          length(keep), ".")
+  
+  list(y = data_spOcc$y[keep, , drop = FALSE],
+       occ.covs = data_spOcc$occ.covs[keep, , drop = FALSE],
+       det.covs = lapply(data_spOcc$det.covs, function(x) {
+          if (is.matrix(x))          x[keep, , drop = FALSE]
+          else if (is.vector(x) || is.factor(x)) x[keep]
+          else x
+    }),
+    coords = data_spOcc$coords[keep, , drop = FALSE]
+  )
+}
+  
+  
+
+
+
 
 
   
